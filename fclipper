@@ -1,0 +1,1028 @@
+#!/bin/dash
+
+
+:<<[/NOTES]
+	
+	Uses "typed variables" for the "fields"
+		- Integer  <name>    [<min> <max>]
+		- Filename <name>    [extension](todo)
+		- String   <name>    [shell-pattern](todo)
+		- Enum     <name>    <value> [value]...
+		- Type     <name>    (creates custom types)
+	note: all variables in a posix shell are actually just strings.
+	      we are just tagging them with a type and providing a validation
+	      function
+    ____________
+	=== TODO ===
+	‾‾‾‾‾‾‾‾‾‾‾‾
+	* container --> file_format
+	* presets (wip)
+	* use escape_pango_string where needed
+	* add view log to error when rendering
+	
+
+[/NOTES]
+
+alias DEBUG_MESSAGE=">&2 echo"
+
+newline="
+"
+
+keyframes=""
+
+path_to_configuration="$HOME/.config/fclipper"
+path_to_presets="$path_to_configuration/presets"
+path_to_filters="$HOME/.config/fclipper/filters.lst"
+
+[ "$loading_state" ] || {
+	loading_state="loading"
+	. "$0"
+
+	# fields="input_filename start_time stop_time video_codec video_quality audio_codec output_filename"
+
+
+	Filename input_filename
+	Integer  start_time
+	Integer  stop_time
+	Enum     encoding_preset "copy"  copy mobile gif
+	Enum     video_codec     "x264"  copy x264 x265 png discard
+	Integer  video_quality   50      0 100
+	Enum     audio_codec     "copy"  copy discard aac
+	Enum     output_format   ""      mp4 mkv gif
+	String   extension       ""     
+	Filename output_filename "@auto"
+	Enum     video_profile   ""      baseline main high high10 high444 high422
+	Enum     pixel_format    ""      yuv420p
+	Enum     skip_frame      ""      none default noref bidir nokey nointra all 
+	String   input_options   ""
+	String   output_options  ""
+ 
+	Type         VideoFilters  String
+	VideoFilters video_filters "" 
+
+	if [ "$1" ]; then
+		input_filename="$1"
+	else
+		gui_prompt_field input_filename
+	fi
+
+	pango_newline="&#13;"
+	
+
+	# Filters List
+	# ‾‾‾‾‾‾‾‾‾‾‾‾
+	# - format: "name|arguments|pretty_name|help_text"
+	# - arguments format: arg1:arg2:...
+		[ -d "$path_to_configuration" ] || setup
+		
+
+
+		load_filters
+
+
+
+	update_fields
+
+	while { gui_main || [ "$return" ]; }; do 
+		
+		
+		case "$return" in
+			"")      gui_render_video;;
+			Presets) gui_select_preset;;
+			*)       gui_prompt_field "$return" || continue;;
+		esac
+	done		
+}
+
+
+
+setup(){
+	zenity --question --text="clipper not setup. setup now?" || exit
+
+		default_filters="# Each line represents a filter with 4 sections, each seperated by the pipe character: name|arguments|pretty_name|help_text
+		# • arguments use the ffmpeg filter format: arg=val:arg:arg=val
+		# • linebreaks can be added with \n
+		scale|width=-1:height=-1:flags=bicubic|Scale (resize) the input video|• Use -1 in width or height to preserve aspect\n• flags: neighbor < bilinear < bicubic < lanczos\n•Height must be divisible by two for most codecs.\nTo avoid automaticaly calculating an invalid height, set the height instead of the width, if possible
+		setpts|expr|Change presentation timestamp|Examples:\nslow-motion: 0.5*PTS
+		hqx|n|HQX pixel art upscaler|Valid values are 2, 3, & 4"
+
+		printf "%s\n" "$default_filters" > "$path_to_filters"
+
+
+
+		[ -f "$path_to_filters" ] || {
+			mkdir -p "${path_to_filters%/*}"
+			printf "%s\n" "$default_filters" > "$path_to_filters"
+		}
+		[ -d "$path_to_presets" ] || {
+			mkdir -p "$path_to_presets"
+			for width in 80 160 240 320 400; do
+				cat > "$path_to_presets/gif-${width}px" <<-END
+					video_codec 
+					audio_codec   discard
+					output_format gif
+					video_filters scale=width=${width}:height=-1
+				END
+			done
+
+			cat > "$path_to_presets/mobile-devices" <<-END
+					video_codec   x264
+					audio_codec   aac
+					output_format mp4
+					video_profile main
+					pixel_format  yuv420p
+			END
+		}
+}
+
+
+
+load_filters(){
+		# read filters from disk, removing comment lines
+		while read -r line; do
+			[ "${line###*}" ] && {
+				escape_pango_string "$line"
+				available_filters="$available_filters$return$newline"
+			}
+		done < "$path_to_filters"
+}
+
+# FUNCTION:  escape_pango_string <in-string>
+# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+# - result is stored in the $return variable
+escape_pango_string(){
+	replace "$1" "&" "&amp;"
+	replace "$return" "\n" "&#13;"
+	replace "$return" "<" "&lt;"
+
+}
+
+
+
+# FUNCTION: replace <in-string> <match-string> <replace-string>
+# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+# - result is stored in the $return variable
+	replace(){
+	    local rest="$1"
+	    local left=""
+	    return=""
+	    while [ "$rest" ]; do
+	        left="${rest%%"$2"*}"                # left will either be segment or the rest of the string if term not found
+	        rest="${rest#"$left"}"               # remove segment (sans term) from rest (or all of it, if no more terms)
+	        return="$return$left${rest:+"$3"}"   # add segment to return, and replacement if any of rest remains
+	        rest="${rest#"$2"}"                  # remove term from rest 
+	    done
+	    
+	    return 0
+	}
+
+
+
+# FUNCTION:  update_fields
+# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+update_fields(){
+	DEBUG_MESSAGE "udate_fields()"
+
+	if [ "$output_filename" != "@auto" ]; then
+		container="${output_filename##*.}"
+		validate_variable container || container=""
+	fi
+	
+	# if [ "$video_codec" = "copy" ]; then
+	case "$video_codec" in
+		(copy)
+			if [ ! "$keyframes" ]; then
+				zenity --progress --pulsate --text="processing"&
+				pid=$!
+				
+				while read -r line; do keyframes="$keyframes ${line%,*}"; done <<-END 
+					$(ffprobe -loglevel error -select_streams v:0 -show_entries packet=pts_time,flags -skip_frame nokey -of csv=print_section=0 "$input_filename" | grep K)
+				END
+				kill "$pid"
+				
+			fi
+
+			start_time__type__="Enum $keyframes"
+			stop_time__type__="Enum $keyframes"		
+			output_fields="input_filename input_options start_time stop_time output_filename output_format video_codec audio_codec  "
+			# echo !
+			;;
+	# else
+		x264|x265)
+			start_time__type__="Integer"
+			stop_time__type__="Integer"
+			output_fields="input_filename input_options start_time stop_time output_filename output_options output_format video_codec video_profile video_quality video_filters pixel_format audio_codec"
+			pixel_format__type="Enum $(ffmpeg -h encoder=lib$video_codec | grep "Supported pixel formats:" | { IFS=: read left right; echo "$right"; })"
+			;;
+		png)
+			output_fields="input_filename input_options start_time stop_time output_filename output_options video_codec skip_frame video_filters"
+			video_profile=""
+			video_quality=""
+			pixel_format=""
+			audio_codec="discard"
+			container=""
+			
+		;;
+	esac
+}
+
+
+
+# FUNCTION:  trim_whitespace <var-name> [var-name=return]
+# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+	trim_whitespace(){
+		read -r "${2:-return}" <<-END
+			$(eval "printf '%s' \"\$$1\"")
+		END
+	}
+
+
+
+# FUNCTION:  gui_error <message>
+# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+	gui_error(){
+		zenity --error --text="$*"
+	}
+
+
+
+# DIALOG:  gui_main
+# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+	gui_main(){
+		local key
+		local help_text
+		while read -r line; do help_text="$help_text$line\n"; done <<-END
+			<big><b>Florian&apos;s Video Clipper</b></big>
+			
+			<b>start_time/stop_time:</b>
+				\t• unit is seconds
+				\t• when video codec is copy, start and stop times are restricted to keyframes
+			<b>video_codec:</b>
+				\t• copy: copies video frames from input, disables video_quality &amp; video_filters
+				\t• x265: older, more compatible, &amp; faster
+				\t• x265: smaller files, higher quality, but less compatible with older devices
+			<b>video_quality:</b>
+				\t• integer between 0 and 100
+				\t• 100 uses the codecs lossless encoding option
+			<b>output_filename:</b>
+				\t• will be automatically set to (input_filename)_clip.(ext) when set to '@auto'
+		END
+
+		return=$(
+			for key in $output_fields; do
+				echo "$key"
+				eval "echo \"\$$key\""
+			done \
+				| { zenity --list --height=800 --column=key --column=value --ok-label=Preview --hide-header --text="$help_text"  --extra-button="Presets";  }
+		)		
+	}
+
+
+
+
+
+# DIALOG:  gui_prompt_field <var-name>
+# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+# - prompts user for value
+# - shows different dialog based on <var-name>'s type
+	gui_prompt_field(){
+		DEBUG_MESSAGE "gui_prompt_field"
+		local key="$1"
+		local value=""
+		return=""
+		# validate field-name ($key)
+		case "$key" in (""|0-9*|*[!a-zA-Z0-9_]*) gui_error "gui_prompt_field(): invalid field name"; return 1;; esac
+
+		# get current value of the field
+		eval "local value=\"\$$key\""
+
+		case "$(typeof "$key")" in
+			(Integer)
+				DEBUG_MESSAGE "(Integer)"
+				value=$(zenity --entry --text="Enter value for '$key'" --entry-text="$value")
+				validate_Integer "$value"
+				;;
+			(Enum)
+				value=$(
+					get_enum_values "$key"
+					printf "%s\n" $enum_values \
+					| zenity --list --text="Select value for '$key'" --column="value"
+				)
+				validate_Enum "$value"
+				;;
+			(String)
+				value=$(zenity --entry --text="Enter value_for $key" --entry-text="$value")
+				;;
+			(Filename)
+				value=$(zenity --file-selection)
+				;;
+			(VideoFilters)
+				gui_video_filters
+				value="$video_filters"
+				
+				;;
+		esac
+		echo "$value"
+		read -r "$key" <<-END
+			$value
+		END
+
+		update_fields
+
+	}
+
+
+
+# DIALOG:  gui_select_preset
+# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+	gui_select_preset(){
+		echo "gui_select_preset()"
+		cd "$path_to_presets"
+		read preset <<-END
+			$(printf "%s\n" * | zenity --list --title="Presets" --column=name --hide-header)
+		END
+		while read key value; do
+			echo "reading $key from $preset"
+			read "$key" <<-END
+				$value
+			END
+		done < "$preset"
+		cd -
+	}
+
+
+
+# DIALOG: gui_video_filters
+# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+# - shows a list of the active video filters
+# - mutates video_filters
+	gui_video_filters(){
+
+		local action filter_name filter_arguments
+
+		while gui_video_filters_show; do :; done
+
+
+				
+
+	}
+
+
+
+
+gui_video_filters_show(){
+		# show list of active video filters
+	IFS="|" read -r action filter_name filter_arguments <<-END
+		$(echo "$video_filters" \
+			| sed "s/,/\n/g" \
+			| while IFS="=" read -r filter_name filter_arguments; do
+				echo "Edit"
+				echo "$filter_name"
+				echo "$filter_arguments"
+			done \
+			| zenity \
+				--list \
+				--title="Video Filters" \
+				--text="The active video filters will be shown in this window." \
+				--column="action" \
+				--column="Filter Name" \
+				--column="Filter Arguments" \
+				--extra-button="Add" \
+				--cancel-label="Done" \
+				--ok-label="Edit" \
+				--hide-column=1 \
+				--print-column="all"
+		)
+	END
+
+	# Handle [Add] button	
+	if [ "$action" = "Add" ]; then
+		gui_video_filters_add
+		gui_video_filters_show
+		return
+	fi
+
+	# "Editor Loop" -- call gui_video_filters_edit (& update_video_filters) until it returns false
+	#                  gui_video_filters_edit --> false --> ^gui_video_filters -> gui_video_filters_show
+	if [ "$action" = "Add" ] || [ "$action" = "Edit" ]; then
+		local done=""
+		while [ ! "$done" ]; do
+			gui_video_filters_edit "$filter_name" "$filter_arguments" || break
+			#done=true
+
+			# update   $video_filters
+			update_video_filters "$filter_name" "$filter_arguments"
+	
+		done
+	else
+		return 1
+	fi
+
+	return 0
+}
+
+
+
+
+# FUNCTION:  update_video_filters <filter-name> <filter-arguments>
+# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+# - updates a filter in $video_filters (or adds it if it doesn't exist)
+# - mutates $video_filters
+	update_video_filters(){
+		DEBUG_MESSAGE "update_video_filters() $*"
+		local filter_name="$1"
+		local filter_arguments="$2"
+		local name arguments
+		[ "$filter_name" ] || return
+		
+		video_filters=$(
+			printf "%s" "$video_filters${video_filters+,}" \
+			| sed "s/,/\n/g" \
+			| {
+				while IFS="=" read -r name arguments; do
+					if [ "$name" = "$filter_name" ]; then
+						# Field found in $video_filters, replace with supplied value
+						printf "%s=%s," "$filter_name" "$filter_arguments"
+						filter_arguments=""
+					else
+						# Copy existing field
+						printf "%s=%s," "$name" "$arguments"
+					fi
+				done 
+				# $filter_arguments set to null if replaced in $video_filters, append if it still has a value
+				if [ "$filter_arguments" ]; then
+					printf "%s=%s," "$filter_name" "$filter_arguments"
+				fi
+			}
+			
+		)
+		# Renove the trailing comma
+		video_filters="${video_filters%,}"
+	}
+
+
+
+# DIALOG:  gui_video_filters_add
+# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+# - shows a list of video filters you can add
+# - mutates video_filters, filter_name, filter_arguments
+	gui_video_filters_add(){
+		local filter_description filter_help
+
+		# Display list of available filters
+		IFS="|" read -r filter_name filter_arguments filter_description filter_help <<-END
+			$(echo "(new)|-|(Create New Filter)|\n$available_filters" \
+				| sed "s/|/\n/g" \
+				| zenity \
+					--list \
+					--title="Add Filter" \
+					--text="Additional filters can be made available here by adding them to $path_to_filters" \
+					--column="Name" \
+					--column="Arguments" \
+					--column="Description" \
+					--column="help text" \
+					--hide-column="2,4" \
+					--print-column="all"
+					# --extra-button="⚙" \
+			)
+			
+		END
+		echo ===$?===
+		[ "$?" = 0 ] || return
+		if [ "$filter_name" = "(new)" ]; then
+			gui_video_filters_create
+			# gui_video_filters_add
+			return
+		fi
+
+		# Update $video_filters (replace existing or append)
+		update_video_filters "$filter_name" "$filter_arguments"
+	}
+
+gui_video_filters_create(){
+	local state="name_desc" filter_name="" filter_description=""
+	while true; do case "$state" in
+		name_desc)
+			result=$(zenity --forms --add-entry=Name --add-entry="Short Description" --ok-label="Next >>>" --title="Create Filter" --text="Overview")
+			if [ $? = 0 ]; then
+				IFS="|" read filter_name filter_description <<-END
+					$result
+				END
+				[ "$filter_name" ] && [ "$filter_description" ] && state="add_argument"
+			elif [ "$filter_name" = "" ]; then
+				return
+			fi 
+			
+			;;
+		add_argument)
+			result=$(zenity --forms --add-entry="Argument Name" --add-entry="Default Value" --ok-label="Save" --title="Create Filter" --text="Add Argument" --extra-button="Discard (continue)")
+			if [ $? = 0 ]; then
+				IFS="|" read key value <<-END
+					$result
+				END
+				[ $key ] ||{
+					zenity --error --text="Invalid entry -- Argument Name is required"
+					continue
+				}
+				filter_arguments="$filter_arguments:$key${value:+=}${value:-}"
+				zenity --question --text="Argument added. Add another argument?" || state="edit_help"
+			elif [ "$key" = "" ]; then
+				return
+			elif [ "$key" = "Discard (continue)" ]; then
+				state="edit_help"
+			fi
+			;;
+		edit_help)
+			while read help_line; do
+				filter_help="$filter_help\n$help_line"
+			done <<-END
+				$(zenity --text-info --editable --title="Create Filter (help text editor)" --ok-label="Done"||echo @cancel)
+			END
+			[ "$filter_help" != "@cancel" ] || return
+			filter_help="${filter_help#"\n"}"
+			break
+			;;
+	esac; done
+
+	filter_arguments="${filter_arguments#:}"
+
+	printf "%s\n" "$filter_name|$filter_arguments|$filter_description|$filter_help" 
+	printf "%s\n" "$filter_name|$filter_arguments|$filter_description|$filter_help" >> "$path_to_filters"
+	 
+	  
+}
+
+# DIALOG:  gui_video_filters_edit <filter-name> <filter-arguments>
+# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+# - edit a filter
+# - mutates filter_arguments
+gui_video_filters_edit(){
+	local filter_name="$1"
+	filter_arguments="$2"
+	local key value pair name _ filter_description filter_help
+
+	# get filter_description & filter_help
+	while IFS="|" read -r name _ filter_description filter_help; do 
+		[ "$name" = "$filter_name" ] && break
+		filter_description=""
+		filter_help=""
+	done <<-END
+		$available_filters
+	END
+
+	
+
+	# Display list of fields for user to select
+	IFS="|" read -r key value <<-END
+		$(echo "$filter_arguments" \
+			| sed "s/:/\n/g" \
+			| while IFS="=" read -r key value; do echo "$key"; echo "$value"; done \
+			| { zenity \
+					--list \
+					--title="Edit Filter - $filter_name" \
+					--text="<b><big>$name</big>\n$filter_description</b>\n$filter_help" \
+					--column="Key" \
+					--column="value" \
+					--cancel-label="Done" \
+					--ok-label="Edit Field" \
+					--extra-button="Remove Filter" \
+					--print-column=all \
+					|| echo "@done"
+			}
+		)
+	END
+
+	echo "====[$key]===="
+	# Handle the [Done] button -- returns to filters list
+	if [ "$key" = "@done" ]; then
+		return 1;
+	fi
+
+	# Handle the [Remove Filter] button -- returns to filters list
+	if [ "$key" = "Remove Filter" ]; then
+		gui_remove_filter "$filter_name"
+		return 1
+	fi
+
+	# Hendle the [Edit Field] button -- prompt user for value
+	value=$(zenity --entry --text="Enter value for '$key'" --entry-text="$value")
+
+	# update $filter_arguments
+	filter_arguments=$(
+		echo "$filter_arguments" \
+		| sed "s/:/\n/g" \
+		| while read -r pair; do
+			if [ "${pair%%=*}" = "$key" ]; then
+				printf "%s=%s:" "$key" "$value"
+			else
+				printf "%s:" "$pair"
+			fi
+		done 
+
+	)
+	
+	# Remove trailing colon
+	filter_arguments="${filter_arguments%:}"
+
+}
+
+
+
+# FUNCTION:  gui_remove_filter <filter-name>
+# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+	gui_remove_filter(){
+		local $filter_name="$1"
+		# Verify w/ user before removing
+		zenity --question --text="Are you sure you want to remove this filter?\n\n($filter_name)" \
+			|| return
+			
+		video_filters=$(
+			echo "$video_filters" \
+			| sed "s/,/\n/g" \
+			| {
+				while IFS="=" read -r name arguments; do
+					if [ "$name" != "$filter_name" ]; then
+						printf "%s=%s," "$name" "$arguments"
+					fi
+				done 
+			}
+		)
+		
+		# Remove trailing comma
+		video_filters="${video_filters%,}"
+
+	}
+
+
+extract_progress(){
+	local total_frames=$(ffprobe -select_streams v:0 -show_entries stream=nb_frames -of default=nokey=1:noprint_wrappers=1 -v quiet -i "$input_filename")
+	case "$total_frames" in (""|0|*[!0-9]*) 
+		zenity --error --text="could not detect number of frames, progress will be inaccurate ($total_frames)"
+		total_frames=1
+		;;
+	esac
+	
+	while IFS== read key value; do
+		[ "$key" = "frame" ] || continue
+		printf "%d\n" $(((value*100)/total_frames))
+		if [ "$frame" = "$total_frames" ]; then
+			zenity --notification --text="Compression has completed" 
+		fi
+	done
+}
+
+
+gui_render_video(){
+	# set defaults
+	# ‾‾‾‾‾‾‾‾‾‾‾‾
+		# : ${start_time:=0}
+		# : ${video_quality:=50}
+		# : ${video_codec:=copy}
+		# : ${audio_codec:=copy}
+
+
+
+	# Handle output_filename @auto
+	# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+		if [ "$output_filename" = "@auto" ]; then
+			local ext="${input_filename##*.}"
+			local output_filename="${input_filename%".$ext"}_clip.${output_format:-"$ext"}"
+			# echo "gui_render_video(): $output_filename"
+		fi
+
+
+	# Delete $output_filename if it already exists
+	# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+		if [ -f "$output_filename" ]; then
+			zenity --question --text="Output file already exits, delete?\n\n($output_filename)" || return
+			rm "$output_filename"
+		fi
+
+
+	# validate start_time and stop_time
+	# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+		for value in "$start_time" "$stop_time"; do case "$value" in
+			(*[!0-9.]*) gui_error "invalid time unit"; return 1;;
+		esac; done
+
+		# TODO verify start_time < stop_time
+
+
+	# Begin building $cmd
+	# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+		cmd="ffmpeg"
+
+
+	# Process time options
+	# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+
+		[ "$start_time" ] && cmd="$cmd -ss $start_time"
+
+		[ "$stop_time" ] && cmd="$cmd -to $stop_time"
+		
+
+
+		# TODO: OFFSET COPIED VIDEOS
+		# if [ "$video_codec" = copy ] && [ "$start_time" ] && [ "$start_time" != 0 ]; then
+		# 	set -- $keyframes
+		# 	while [ "$2" != "$start_time" ]; do shift; done
+		# 	start_time="$1"
+		# 	cmd="$cmd -output_ts_offset $(echo "$1 $2"|awk '{printf "%f", $1 + $2}')"
+		# fi
+
+	# Finish input side of ffmpeg
+	# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+
+		cmd="$cmd $input_options -i \"$input_filename\""
+
+
+	# Process video options
+	# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+
+		# Calculte $crf
+		if [ "$video_quality" = 100 ]; then
+			crf=0
+		else
+			# we're adding 3 here because crf=0 is lossless
+			crf=$((($video_quality+3)*51/103))
+		fi
+
+
+		
+		case "$video_codec" in
+			discard) cmd="$cmd -vn";;
+			copy)    cmd="$cmd -c:v copy";;
+			x264)    cmd="$cmd -c:v libx264 -crf $crf";;
+			x265)    cmd="$cmd -c:v libx265 -crf $crf";;
+			png)     cmd="$cmd -c:v png";;
+        	"")      : ;;
+			*)	echo "Invalid video codec selection"
+			    exit 1
+			    ;;
+		esac
+		
+		if [ "$video_filters" ]; then
+			cmd="$cmd -vf \"$video_filters\""
+		fi
+
+		if [ "$video_profile" ]; then
+			cmd="$cmd -profile:v $video_profile"
+		fi
+		
+		if [ "$pixel_format" ]; then
+			cmd="$cmd -pix_fmt $pixel_format"
+		fi
+
+
+
+	# Process audio options
+	# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+
+
+		case "$audio_codec" in
+			""|" "|copy) cmd="$cmd -c:a copy";;
+			discard)     cmd="$cmd -an";;
+			aac)         cmd="$cmd -c:a aac";;
+			*)
+				echo "Invalid audio selection"
+				exit 1
+				;;
+		esac
+
+
+	# Finish building $cmd
+	# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+	cmd="$cmd $output_options -progress - -nostats \"$output_filename\""
+
+	# TODO: embed ffmpeg encoding options in output file
+	# replace "$cmd" '"' "'"
+	# replace "$return" "-" "^"
+	# cmd="$cmd -metadata comment="$return" 2> /tmp/video-clip.log"
+
+
+	# Render Video
+	# ‾‾‾‾‾‾‾‾‾‾‾‾
+
+	
+	echo "$cmd"
+	{ eval "$cmd" || zenity --text-info --text="There was an error, the output of ffmpeg is displayed below" --filename=/tmp/video-clip.log >/dev/null; } \
+		| extract_progress \
+		| { zenity --progress --time-remaining ||  { pkill -KILL -g $$ ffmpeg; return; }; }
+		# | zenity --progress --auto-close --time-remaining
+		# |zenity --text-info
+
+	
+
+	# Check for errors in logfile
+	# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+	grep Error /tmp/video-clip.log && {
+		gui_error "$(grep -i Error /tmp/video-clip.log)"
+		return
+	}
+
+
+
+	# Display Preview
+	# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+	ffplay "$output_filename" 2> /dev/null
+
+
+	# prompt user
+	# ‾‾‾‾‾‾‾‾‾‾‾
+	zenity --question --text="Save video or continue editing?" --ok-label="Save & Exit" --cancel-label="Back to Editor" && exit
+	rm "$output_filename"
+}
+
+
+# Typed Constructors
+# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+
+# General use syntax: <Type> <name> <type-arguments>
+
+	validate_name(){
+		case "$1" in (""|0-9*|*[!a-zA-Z0-9_]*) ERROR "validate_name(): invalid variable name"; return 1;; esac
+	}
+	# FUNCTION:  get_type <name>
+	# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+	# - sets $type to variable type, or "ShellVariable" if it is a regular shell variable
+		get_type(){
+			local rest variable_name="$1"
+			validate_name "$variable_name"
+			
+			read -r type rest <<-END
+				$(eval "printf \"%s\" \"\${${variable_name}__type__:-ShellVariable}\"")
+			END
+		}
+
+		
+
+	# FUNCTION:  typeof <name>
+	# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+	# - prints variable type, or "ShellVariable" if it is a regular shell variable
+		typeof(){
+			local type
+			get_type "$1"
+			printf "%s" "$type"
+		}
+		
+	# INTERNAL-FUNCTION:  create_typed_variable() <type> <variable-name> [<initial-value> [variable-options]]
+		create_typed_variable(){
+			local variable_type="$1"
+			local variable_name="$2"
+			local initial_value="${3:-}"
+			
+			validate_name "$variable_name"
+			
+			if [ "$initial_value" ]; then
+				read -r "${variable_name?}" <<-END
+					$initial_value
+				END
+				shift 3	
+			else
+				shift 2
+			fi
+							
+			read -r "${variable_name?}__type__" <<-END
+				$variable_type $*
+			END
+			
+			
+		}
+
+	# FUNCTION:  validate_variable <name>
+	# - calls a typed-variable's validate function
+	validate_variable(){
+			local variable_name variable_value variable_type variable_type_arguments
+			# Reference variable_name "$1"
+			# getReferencedValue variable_name variable_value
+			variable_name="$1"
+
+			validate_name "$variable_name" || return 1
+
+			eval "variable_value=\"\$$variable_name\""
+
+			# read variable's __type__
+			read -r variable_type variable_type_arguments <<-END
+				$(eval "printf \"%s\" \"\$${variable_name}__type__\"")
+			END
+
+			# call validator
+			case "$(type "validate_${variable_type}")" in
+				(*function*) 
+					validate_${variable_type} "$variable_value" $variable_type_arguments
+					return
+					;;
+				(*)
+					return 0
+			esac
+	}
+
+
+	# Integer
+	# ‾‾‾‾‾‾‾
+		# TYPE:  Integer <name> <value> <min> <max>
+		# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+			Integer(){
+				create_typed_variable Integer "$@"
+			}
+
+		# FUNCTION:  validate_Integer <value> <type-arguments>
+		# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+			validate_Integer(){
+				# local variable_name="$1"
+				# local variable_value=""
+				# 
+				# validate_name "$variable_name"
+				local value="$1"
+				shift
+
+				
+				case "$value" in (*[!0-9-]*) ERROR "validate_Integer(): invalid value, must be an integer"; return 1;; esac
+				if [ $# = 2 ]; then
+					[ "$value" -ge "$1" ] && [ "$return" -le "$2" ] || { 
+						ERROR "validate_Integer(): invalid value, must be between $1 and $2 (inclusive)"
+						return 1
+					}
+				fi
+
+			}
+
+	# String
+	# ‾‾‾‾‾‾
+
+
+	
+
+		String(){
+	
+			create_typed_variable String "$@"
+		}
+
+
+		validate_String(){
+			local value="$1"
+			shift
+
+			case "$value" in 
+				($2) return 0;; 
+				(*)  return 1;;
+			esac
+		}
+
+		Bool(){
+			create_typed_variable Bool "$@"
+		}
+
+	# Enum
+	# ‾‾‾‾
+
+		Enum(){
+			create_typed_variable Enum "$@"
+		}
+
+		# FUNCTION:  get_enum_values <name>
+		# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+		# - sets $enum_values
+			get_enum_values(){
+				local type variable_name="$1"
+				validate_name "$variable_name"
+
+				# eval "printf \"%s\" \"\${${variable_name}__type__:-ShellVariable}\" >&2"
+				
+				read -r type enum_values <<-END
+					$(eval "printf \"%s\" \"\${${variable_name}__type__:-ShellVariable}\"")
+				END
+				
+				if [ "$type" != "Enum" ]; then
+					enum_values=""
+				fi
+			}
+		
+		# FUNCTION:  validate_Enum <value> <type-arguments>
+		# ‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+			validate_Enum(){
+				local value="$1"
+				shift
+
+				for possible_value; do
+					[ "$value" = "$possible_value" ] && return 0
+				done
+
+				return 1
+			}
+			
+	# Filename
+	# ‾‾‾‾‾‾‾‾
+
+		Filename(){
+			create_typed_variable Filename "$@"
+		}
+
+	# Type
+	# ‾‾‾‾
+
+		Type(){
+			eval "$1(){ create_typed_variable \"$1\" \"\$@\"; }"
+		}
+
+
